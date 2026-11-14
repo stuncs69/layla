@@ -1,15 +1,18 @@
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::board::{Board, STANDARD_STARTPOS_FEN};
 use crate::perft::perft;
-use crate::search::{SearchLimits, Searcher};
+use crate::search::{Iteration, Score, SearchLimits, Searcher};
 
 pub fn run() -> Result<(), String> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-    let mut searcher = Searcher::new();
+    let mut searcher = Searcher::new(64);
     let mut board = Board::startpos(&searcher.zobrist);
+    let mut history: Vec<u64> = Vec::new();
+    let stop = AtomicBool::new(false);
 
     for line in stdin.lock().lines() {
         let line = line.map_err(|err| err.to_string())?;
@@ -26,12 +29,19 @@ pub fn run() -> Result<(), String> {
             writeln!(stdout, "readyok").map_err(|err| err.to_string())?;
         } else if command == "ucinewgame" {
             board = Board::startpos(&searcher.zobrist);
+            history.clear();
             searcher.clear();
         } else if command.starts_with("position ") {
-            parse_position(command, &mut board, &mut searcher)?;
+            parse_position(command, &mut board, &mut history, &searcher)?;
         } else if command.starts_with("go") {
             let limits = parse_go(command);
-            let result = searcher.search(&mut board, limits);
+            let mut info_result = Ok(());
+            let result = searcher.search(&mut board, &history, limits, &stop, &mut |it| {
+                if info_result.is_ok() {
+                    info_result = writeln!(stdout, "{}", format_info(it));
+                }
+            });
+            info_result.map_err(|err| err.to_string())?;
             writeln!(stdout, "bestmove {}", result.best_move.to_uci())
                 .map_err(|err| err.to_string())?;
         } else if command.starts_with("perft ") {
@@ -51,7 +61,29 @@ pub fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn parse_position(command: &str, board: &mut Board, searcher: &mut Searcher) -> Result<(), String> {
+fn format_info(it: &Iteration) -> String {
+    let score = match it.score {
+        Score::Cp(cp) => format!("cp {cp}"),
+        Score::Mate(moves) => format!("mate {moves}"),
+    };
+    let pv: Vec<String> = it.pv.iter().map(|mv| mv.to_uci()).collect();
+    format!(
+        "info depth {} score {} nodes {} time {} nps {} pv {}",
+        it.depth,
+        score,
+        it.nodes,
+        it.time_ms,
+        it.nps,
+        pv.join(" ")
+    )
+}
+
+fn parse_position(
+    command: &str,
+    board: &mut Board,
+    history: &mut Vec<u64>,
+    searcher: &Searcher,
+) -> Result<(), String> {
     let rest = command
         .strip_prefix("position ")
         .ok_or_else(|| String::from("bad position"))?;
@@ -71,6 +103,7 @@ fn parse_position(command: &str, board: &mut Board, searcher: &mut Searcher) -> 
     } else {
         return Err(String::from("unsupported position command"));
     }
+    history.clear();
 
     let trailing: Vec<&str> = tokens.collect();
     if let Some(idx) = trailing.iter().position(|tok| *tok == "moves") {
@@ -78,6 +111,7 @@ fn parse_position(command: &str, board: &mut Board, searcher: &mut Searcher) -> 
             let mv = board
                 .parse_uci_move(mv_text, &searcher.attacks, &searcher.zobrist)
                 .ok_or_else(|| format!("illegal move: {mv_text}"))?;
+            history.push(board.zobrist_key);
             let _undo = board
                 .make_move(mv, &searcher.attacks, &searcher.zobrist)
                 .ok_or_else(|| format!("failed to make move: {mv_text}"))?;
